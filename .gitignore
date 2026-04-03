@@ -1,0 +1,13 @@
+QuickLauncherNative.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.o
+*.log
+
+.vs/
+build/
+x64/
+x86/
