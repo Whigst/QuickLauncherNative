@@ -155,7 +155,8 @@ private:
         const std::vector<std::wstring>& queryTokens,
         const UsageStat* usage,
         int queryAffinity,
-        int priorityBoost);
+        int priorityBoost,
+        const std::wstring& preferredExtension);
     std::vector<size_t> BuildCandidateIndicesLocked(
         const std::wstring& query,
         const std::wstring& queryCompact,
@@ -172,6 +173,7 @@ private:
         const std::unordered_map<std::wstring, QueryBucket>& queryHistorySnapshot,
         const std::vector<std::wstring>& excludedRoots,
         const std::vector<std::wstring>& priorityRoots,
+        const std::wstring& preferredExtension,
         unsigned long long requestId,
         const std::vector<size_t>* candidateIndices,
         std::vector<size_t>* matchedIndices) const;
@@ -235,6 +237,7 @@ private:
     bool searchRequestPending_ = false;
     unsigned long long pendingSearchRequestId_ = 0;
     std::wstring pendingSearchQuery_;
+    std::wstring pendingSearchPreferredExtension_;
     std::shared_ptr<std::vector<LaunchEntry>> pendingSearchEntries_;
     std::unordered_map<std::wstring, UsageStat> pendingSearchUsage_;
     std::unordered_map<std::wstring, QueryBucket> pendingSearchHistory_;

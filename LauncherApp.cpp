@@ -259,6 +259,12 @@ struct HotkeyParseResult
     std::wstring label = L"Alt+Space";
 };
 
+struct SearchDirective
+{
+    std::wstring queryText;
+    std::wstring preferredExtension;
+};
+
 std::vector<std::wstring> SplitHotkeyTokens(const std::wstring& value)
 {
     std::vector<std::wstring> tokens;
@@ -539,6 +545,34 @@ bool IsPreferredLaunchSurface(const LaunchEntry& entry)
             || entry.sourceTag == L"Start Menu"
             || entry.sourceTag == L"Desktop"
             || entry.sourceTag == L"Pinned");
+}
+
+SearchDirective ParseSearchDirective(const std::wstring& rawQuery)
+{
+    SearchDirective directive{};
+    directive.queryText = rawQuery;
+
+    const auto trimmed = TrimCopy(rawQuery);
+    if (!StartsWith(trimmed, L"/."))
+    {
+        return directive;
+    }
+
+    const auto colonIndex = trimmed.find(L':');
+    if (colonIndex == std::wstring::npos || colonIndex <= 2)
+    {
+        return directive;
+    }
+
+    const auto extension = ToLowerCopy(trimmed.substr(1, colonIndex - 1));
+    if (!IsLaunchableExtension(extension))
+    {
+        return directive;
+    }
+
+    directive.preferredExtension = extension;
+    directive.queryText = TrimCopy(trimmed.substr(colonIndex + 1));
+    return directive;
 }
 
 bool IsScriptLikeExtension(const std::wstring& extension)
@@ -1922,6 +1956,7 @@ void LauncherApp::SearchLoop()
         while (!shuttingDown_)
         {
             std::wstring query;
+            std::wstring preferredExtension;
             std::shared_ptr<std::vector<LaunchEntry>> entriesSnapshot;
             std::unordered_map<std::wstring, UsageStat> usageSnapshot;
             std::unordered_map<std::wstring, QueryBucket> queryHistorySnapshot;
@@ -1941,6 +1976,7 @@ void LauncherApp::SearchLoop()
 
                 searchRequestPending_ = false;
                 query = pendingSearchQuery_;
+                preferredExtension = pendingSearchPreferredExtension_;
                 entriesSnapshot = pendingSearchEntries_;
                 usageSnapshot = pendingSearchUsage_;
                 queryHistorySnapshot = pendingSearchHistory_;
@@ -1960,6 +1996,7 @@ void LauncherApp::SearchLoop()
                 queryHistorySnapshot,
                 excludedRoots,
                 priorityRoots,
+                preferredExtension,
                 requestId,
                 candidateIndices.empty() ? nullptr : &candidateIndices,
                 &matchedIndices);
@@ -2100,7 +2137,7 @@ void LauncherApp::PositionWindow()
     const int width = 880;
     const int height = 382;
     const int x = work.left + ((work.right - work.left) - width) / 2;
-    const int y = work.top + std::max(26, static_cast<int>((work.bottom - work.top) / 10));
+    const int y = work.top + ((work.bottom - work.top) - height) / 2;
 
     SetWindowPos(mainWindow_, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
 }
@@ -2159,7 +2196,9 @@ void LauncherApp::RebuildSearchCaches()
 
 void LauncherApp::UpdateResults()
 {
-    const auto query = ReadControlText(queryEdit_);
+    const auto rawQuery = ReadControlText(queryEdit_);
+    const auto directive = ParseSearchDirective(rawQuery);
+    const auto& query = directive.queryText;
     const auto queryCompact = NormalizeCompact(query);
     const auto queryTokens = TokenizeQuery(query);
     LaunchEntry directEntry;
@@ -2188,6 +2227,7 @@ void LauncherApp::UpdateResults()
         queryHistorySnapshot,
         excludedRoots,
         priorityRoots,
+        directive.preferredExtension,
         0,
         candidateIndices.empty() ? nullptr : &candidateIndices,
         nullptr);
@@ -2234,7 +2274,9 @@ void LauncherApp::RequestSearchUpdate()
         return;
     }
 
-    const auto query = ReadControlText(queryEdit_);
+    const auto rawQuery = ReadControlText(queryEdit_);
+    const auto directive = ParseSearchDirective(rawQuery);
+    const auto& query = directive.queryText;
     const auto queryCompact = NormalizeCompact(query);
     const auto queryTokens = TokenizeQuery(query);
     LaunchEntry directEntry;
@@ -2243,6 +2285,7 @@ void LauncherApp::RequestSearchUpdate()
     {
         ScopedCriticalSection lock(dataLock_);
         pendingSearchQuery_ = query;
+        pendingSearchPreferredExtension_ = directive.preferredExtension;
         pendingSearchEntries_ = entries_;
         pendingSearchUsage_ = usage_;
         pendingSearchHistory_ = queryHistory_;
@@ -3409,7 +3452,8 @@ void LauncherApp::SaveUsageSnapshot(
 void LauncherApp::RecordLaunch(const std::wstring& fullPath, const std::wstring& query)
 {
     const auto now = CurrentUtcTicks();
-    const auto queryCompact = NormalizeCompact(query);
+    const auto directive = ParseSearchDirective(query);
+    const auto queryCompact = NormalizeCompact(directive.queryText);
     std::shared_ptr<std::vector<LaunchEntry>> entriesSnapshot;
     std::unordered_map<std::wstring, UsageStat> usageSnapshot;
     std::unordered_map<std::wstring, QueryBucket> queryHistorySnapshot;
@@ -3526,16 +3570,34 @@ int LauncherApp::CalculateScore(
     const std::vector<std::wstring>& queryTokens,
     const UsageStat* usage,
     int queryAffinity,
-    int priorityBoost)
+    int priorityBoost,
+    const std::wstring& preferredExtension)
 {
     const int extensionBoost = ExtensionBoost(entry.extension);
     const int categoryBoost = GetEntryCategoryBoost(entry, queryCompact.size());
     const int usageBoost = std::min((usage == nullptr ? 0 : usage->launchCount) * 90, 1200);
     const int recencyBoost = CalculateRecencyBoost(usage == nullptr ? 0 : usage->lastLaunchUtcTicks);
+    int directiveBoost = 0;
+
+    if (!preferredExtension.empty())
+    {
+        if (entry.extension == preferredExtension)
+        {
+            directiveBoost = 1600;
+        }
+        else if (entry.isDirectory || entry.isUrl)
+        {
+            directiveBoost = -320;
+        }
+        else
+        {
+            directiveBoost = -220;
+        }
+    }
 
     if (queryCompact.empty())
     {
-        return 900 + usageBoost + recencyBoost + extensionBoost + categoryBoost + priorityBoost
+        return 900 + usageBoost + recencyBoost + extensionBoost + categoryBoost + priorityBoost + directiveBoost
             - std::min(static_cast<int>(entry.name.size()) * 3, 180);
     }
 
@@ -3566,7 +3628,7 @@ int LauncherApp::CalculateScore(
 
     const int affinityBoost = std::min(queryAffinity * 320, 2600);
     int score = nameScore * 2 + initialsScore * 2 + pathScore + tokenBonus + affinityBoost + usageBoost + recencyBoost
-        + extensionBoost + categoryBoost + priorityBoost;
+        + extensionBoost + categoryBoost + priorityBoost + directiveBoost;
     score -= std::min(static_cast<int>(entry.name.size()) * 4, 220);
     return score;
 }
@@ -3681,7 +3743,7 @@ std::vector<size_t> LauncherApp::BuildEmptyQueryCandidateIndices(
             }
         }
 
-        const int score = CalculateScore(entry, L"", {}, usage, 0, priorityBoost);
+        const int score = CalculateScore(entry, L"", {}, usage, 0, priorityBoost, L"");
         if (score <= 0)
         {
             continue;
@@ -3706,6 +3768,7 @@ std::vector<SearchResult> LauncherApp::BuildResultsForQuery(
     const std::unordered_map<std::wstring, QueryBucket>& queryHistorySnapshot,
     const std::vector<std::wstring>& excludedRoots,
     const std::vector<std::wstring>& priorityRoots,
+    const std::wstring& preferredExtension,
     unsigned long long requestId,
     const std::vector<size_t>* candidateIndices,
     std::vector<size_t>* matchedIndices) const
@@ -3777,7 +3840,7 @@ std::vector<SearchResult> LauncherApp::BuildResultsForQuery(
             }
         }
 
-        const int score = CalculateScore(entry, queryCompact, queryTokens, usage, affinity, priorityBoost);
+        const int score = CalculateScore(entry, queryCompact, queryTokens, usage, affinity, priorityBoost, preferredExtension);
         if (score <= 0)
         {
             return true;
