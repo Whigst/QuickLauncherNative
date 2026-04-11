@@ -41,6 +41,7 @@ constexpr int kControlQuery = 2001;
 constexpr int kControlResults = 2002;
 constexpr int kControlPath = 2003;
 constexpr int kControlStatus = 2004;
+constexpr int kControlAutostartToggle = 2005;
 
 struct LauncherSettings
 {
@@ -112,13 +113,17 @@ private:
     void PopulateResultsList();
     void UpdateSelectedPath();
     void UpdateFooter();
+    void RefreshAutostartToggle();
+    void ToggleAutostartSetting();
     void MoveSelection(int offset);
     void LaunchSelected();
     void LaunchSelectedAsAdmin();
     void OpenSelectedLocation();
     void CopySelectedPath();
     void ShowSelectedContextMenu(POINT screenPoint, bool fromKeyboard);
+    void DrawWindowBackground(HDC hdc);
     void DrawResultItem(const DRAWITEMSTRUCT* drawItem);
+    void DrawAutostartToggle(const DRAWITEMSTRUCT* drawItem);
     void EnsureShellImageList();
     int ResolveIconIndex(LaunchEntry& entry);
     bool TryBuildDirectEntry(const std::wstring& query, LaunchEntry& entry) const;
@@ -197,6 +202,12 @@ private:
     HWND resultsList_ = nullptr;
     HWND pathLabel_ = nullptr;
     HWND statusLabel_ = nullptr;
+    HWND mainTitleLabel_ = nullptr;
+    HWND mainSubtitleLabel_ = nullptr;
+    HWND sidebarChipLabel_ = nullptr;
+    HWND sidebarFooterLabel_ = nullptr;
+    HWND autostartLabel_ = nullptr;
+    HWND autostartToggle_ = nullptr;
 
     HFONT titleFont_ = nullptr;
     HFONT normalFont_ = nullptr;
@@ -250,6 +261,7 @@ private:
     std::wstring settingsPath_;
     std::wstring userProfilePath_;
     std::wstring activeHotkeyLabel_ = L"Alt+Space";
+    bool autostartEnabled_ = false;
     std::vector<std::wstring> desktopRoots_;
     std::vector<std::wstring> startMenuRoots_;
     std::vector<std::wstring> pinnedRoots_;

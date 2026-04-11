@@ -13,6 +13,7 @@ A native Win32 launcher focused on low background overhead.
 - Search `.exe`, `.bat`, `.cmd`, `.ps1`, `.vbs`, `.lnk`, `.msc`, and similar launch targets
 - Fuzzy matching plus initials matching for acronym and pinyin-initial style search
 - Frequent launches and query-specific history move results upward
+- Launchable results like `.lnk`, `.exe`, `.bat`, and `.cmd` are ranked ahead of folder matches
 - Empty query uses a cached home list, so hotkey summon can show recommendations without a fresh full-index sort
 - Start Menu, Desktop, and pinned shortcut entries get extra ranking priority
 - Same-name shortcut-heavy results are lightly deduplicated to reduce noise
@@ -22,6 +23,7 @@ A native Win32 launcher focused on low background overhead.
 - Automatically debounces changes in quick-access folders and configured roots, then refreshes in the background
 - Hotkey summon clears the query, `Ctrl+A` selects all input, `Ctrl+Shift+Enter` runs as administrator, `Shift+Enter` reveals in Explorer, and `Ctrl+C` copies the full path
 - Right-click a result, or press the menu key / `Shift+F10`, for launch, admin, reveal, and copy actions
+- Main window includes a `Run at Startup` toggle switch, while the tray menu keeps the same option as a backup path
 - Tray menu with open, rebuild index, settings, autostart toggle, and exit
 - Folder entries are indexed from your user profile plus configured `include` and `priority` directories to keep background memory lower
 

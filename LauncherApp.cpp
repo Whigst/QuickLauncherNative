@@ -541,6 +541,83 @@ bool IsPreferredLaunchSurface(const LaunchEntry& entry)
             || entry.sourceTag == L"Pinned");
 }
 
+bool IsScriptLikeExtension(const std::wstring& extension)
+{
+    return extension == L".ps1"
+        || extension == L".vbs"
+        || extension == L".vbe"
+        || extension == L".js"
+        || extension == L".jse"
+        || extension == L".wsf";
+}
+
+bool IsPrimaryLaunchExtension(const std::wstring& extension)
+{
+    return extension == L".exe"
+        || extension == L".lnk"
+        || extension == L".appref-ms"
+        || extension == L".bat"
+        || extension == L".cmd"
+        || extension == L".com"
+        || extension == L".msc"
+        || extension == L".msi";
+}
+
+int GetEntryResultRank(const LaunchEntry& entry)
+{
+    if (IsPreferredLaunchSurface(entry))
+    {
+        return 0;
+    }
+
+    if (!entry.isDirectory && !entry.isUrl && IsPrimaryLaunchExtension(entry.extension))
+    {
+        return 1;
+    }
+
+    if (!entry.isDirectory && !entry.isUrl)
+    {
+        return 2;
+    }
+
+    if (entry.isDirectory)
+    {
+        return 3;
+    }
+
+    return 4;
+}
+
+int GetEntryCategoryBoost(const LaunchEntry& entry, size_t queryLength)
+{
+    if (entry.isUrl)
+    {
+        return -240;
+    }
+
+    if (entry.isDirectory)
+    {
+        return queryLength <= 3 ? -420 : -260;
+    }
+
+    if (IsPreferredLaunchSurface(entry))
+    {
+        return queryLength <= 3 ? 1800 : 1100;
+    }
+
+    if (IsPrimaryLaunchExtension(entry.extension))
+    {
+        return queryLength <= 3 ? 900 : 520;
+    }
+
+    if (IsScriptLikeExtension(entry.extension))
+    {
+        return queryLength <= 3 ? -320 : -140;
+    }
+
+    return 120;
+}
+
 void AppendPrefixKeys(std::unordered_set<std::wstring>& keys, const std::wstring& token)
 {
     if (token.empty())
@@ -642,6 +719,7 @@ bool LauncherApp::Initialize(HINSTANCE instance)
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = WindowProc;
+    windowClass.style = CS_DROPSHADOW;
     windowClass.hInstance = instance_;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
@@ -656,11 +734,11 @@ bool LauncherApp::Initialize(HINSTANCE instance)
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         windowClass.lpszClassName,
         L"QuickLauncherNative",
-        WS_POPUP | WS_BORDER,
+        WS_POPUP | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         880,
-        420,
+        382,
         nullptr,
         nullptr,
         instance_,
@@ -671,6 +749,7 @@ bool LauncherApp::Initialize(HINSTANCE instance)
         return false;
     }
 
+    autostartEnabled_ = IsAutostartEnabled();
     EnsureSettingsFileExists();
     LoadSettings();
     LoadUsage();
@@ -775,13 +854,26 @@ LRESULT LauncherApp::HandleMessage(HWND window, UINT message, WPARAM wParam, LPA
 
     case WM_SIZE:
         LayoutControls();
+        InvalidateRect(mainWindow_, nullptr, TRUE);
         return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        const HDC hdc = BeginPaint(window, &paint);
+        DrawWindowBackground(hdc);
+        EndPaint(window, &paint);
+        return 0;
+    }
 
     case WM_MEASUREITEM:
         if (wParam == kControlResults)
         {
             auto* measureItem = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-            measureItem->itemHeight = 32;
+            measureItem->itemHeight = 42;
             return TRUE;
         }
         break;
@@ -790,6 +882,11 @@ LRESULT LauncherApp::HandleMessage(HWND window, UINT message, WPARAM wParam, LPA
         if (wParam == kControlResults)
         {
             DrawResultItem(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
+        }
+        if (wParam == kControlAutostartToggle)
+        {
+            DrawAutostartToggle(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
             return TRUE;
         }
         break;
@@ -801,6 +898,45 @@ LRESULT LauncherApp::HandleMessage(HWND window, UINT message, WPARAM wParam, LPA
             return 0;
         }
         break;
+
+    case WM_NCHITTEST:
+    {
+        const LRESULT hit = DefWindowProcW(window, message, wParam, lParam);
+        if (hit != HTCLIENT)
+        {
+            return hit;
+        }
+
+        POINT point{
+            static_cast<SHORT>(LOWORD(lParam)),
+            static_cast<SHORT>(HIWORD(lParam))
+        };
+        ScreenToClient(window, &point);
+
+        auto isInsideChild = [&](HWND child) -> bool
+        {
+            if (child == nullptr || !IsWindowVisible(child))
+            {
+                return false;
+            }
+
+            RECT childRect{};
+            GetWindowRect(child, &childRect);
+            POINT topLeft{childRect.left, childRect.top};
+            POINT bottomRight{childRect.right, childRect.bottom};
+            ScreenToClient(window, &topLeft);
+            ScreenToClient(window, &bottomRight);
+            RECT localRect{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+            return PtInRect(&localRect, point) != FALSE;
+        };
+
+        if (isInsideChild(queryEdit_) || isInsideChild(resultsList_) || isInsideChild(autostartToggle_))
+        {
+            return HTCLIENT;
+        }
+
+        return HTCAPTION;
+    }
 
     case WM_COMMAND:
         if (LOWORD(wParam) == kControlQuery && HIWORD(wParam) == EN_CHANGE)
@@ -818,6 +954,12 @@ LRESULT LauncherApp::HandleMessage(HWND window, UINT message, WPARAM wParam, LPA
         if (LOWORD(wParam) == kControlResults && HIWORD(wParam) == LBN_DBLCLK)
         {
             LaunchSelected();
+            return 0;
+        }
+
+        if (LOWORD(wParam) == kControlAutostartToggle && HIWORD(wParam) == BN_CLICKED)
+        {
+            ToggleAutostartSetting();
             return 0;
         }
 
@@ -847,15 +989,7 @@ LRESULT LauncherApp::HandleMessage(HWND window, UINT message, WPARAM wParam, LPA
 
         if (LOWORD(wParam) == kCommandTrayToggleAutostart)
         {
-            const bool enabled = IsAutostartEnabled();
-            if (SetAutostartEnabled(!enabled))
-            {
-                PublishStatus(!enabled ? L"Autostart enabled." : L"Autostart disabled.");
-            }
-            else
-            {
-                PublishStatus(L"Failed to update autostart.");
-            }
+            ToggleAutostartSetting();
             return 0;
         }
 
@@ -889,6 +1023,85 @@ LRESULT LauncherApp::HandleMessage(HWND window, UINT message, WPARAM wParam, LPA
             return 0;
         }
         break;
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        HWND control = reinterpret_cast<HWND>(lParam);
+        SetBkMode(hdc, TRANSPARENT);
+
+        if (control == pathLabel_ || control == statusLabel_ || control == autostartLabel_)
+        {
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, RGB(255, 255, 255));
+            if (control == pathLabel_)
+            {
+                SetTextColor(hdc, RGB(89, 96, 107));
+            }
+            else if (control == statusLabel_)
+            {
+                SetTextColor(hdc, RGB(122, 127, 133));
+            }
+            else
+            {
+                SetTextColor(hdc, RGB(116, 120, 126));
+            }
+            return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+        }
+
+        if (control == titleLabel_)
+        {
+            SetTextColor(hdc, RGB(24, 24, 24));
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        }
+
+        if (control == sidebarChipLabel_)
+        {
+            SetTextColor(hdc, RGB(39, 52, 89));
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        }
+
+        if (control == hintLabel_)
+        {
+            SetTextColor(hdc, RGB(118, 121, 126));
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        }
+
+        if (control == sidebarFooterLabel_)
+        {
+            SetTextColor(hdc, RGB(123, 110, 96));
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        }
+
+        if (control == mainTitleLabel_)
+        {
+            SetTextColor(hdc, RGB(18, 18, 18));
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        }
+
+        if (control == mainSubtitleLabel_)
+        {
+            SetTextColor(hdc, RGB(116, 120, 126));
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        }
+        break;
+    }
+
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetBkColor(hdc, RGB(255, 255, 255));
+        SetTextColor(hdc, RGB(28, 30, 34));
+        return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+    }
+
+    case WM_CTLCOLORLISTBOX:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetBkColor(hdc, RGB(255, 255, 255));
+        SetTextColor(hdc, RGB(28, 30, 34));
+        return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+    }
 
     case WM_TIMER:
         if (wParam == kFocusTimerId)
@@ -1121,33 +1334,46 @@ LRESULT LauncherApp::HandleListMessage(HWND window, UINT message, WPARAM wParam,
 
 void LauncherApp::CreateFonts()
 {
-    titleFont_ = CreateFontW(-24, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    titleFont_ = CreateFontW(-28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     normalFont_ = CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    smallFont_ = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    smallFont_ = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 }
 
 void LauncherApp::CreateControls()
 {
     titleLabel_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
-    hintLabel_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
-    queryEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, mainWindow_, reinterpret_cast<HMENU>(kControlQuery), instance_, nullptr);
-    resultsList_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_OWNERDRAWFIXED | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 0, 0, 0, 0, mainWindow_, reinterpret_cast<HMENU>(kControlResults), instance_, nullptr);
+    hintLabel_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
+    sidebarChipLabel_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
+    sidebarFooterLabel_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
+    mainTitleLabel_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
+    mainSubtitleLabel_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
+    queryEdit_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, mainWindow_, reinterpret_cast<HMENU>(kControlQuery), instance_, nullptr);
+    resultsList_ = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_OWNERDRAWFIXED | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 0, 0, 0, 0, mainWindow_, reinterpret_cast<HMENU>(kControlResults), instance_, nullptr);
     pathLabel_ = CreateWindowExW(0, L"STATIC", L"Waiting for index...", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, mainWindow_, reinterpret_cast<HMENU>(kControlPath), instance_, nullptr);
     statusLabel_ = CreateWindowExW(0, L"STATIC", L"Initializing...", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, mainWindow_, reinterpret_cast<HMENU>(kControlStatus), instance_, nullptr);
+    autostartLabel_ = CreateWindowExW(0, L"STATIC", L"Run at Startup", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, mainWindow_, nullptr, instance_, nullptr);
+    autostartToggle_ = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, mainWindow_, reinterpret_cast<HMENU>(kControlAutostartToggle), instance_, nullptr);
 
     SendMessageW(titleLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont_), TRUE);
     SendMessageW(hintLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+    SendMessageW(sidebarChipLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
+    SendMessageW(sidebarFooterLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+    SendMessageW(mainTitleLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont_), TRUE);
+    SendMessageW(mainSubtitleLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
     SendMessageW(queryEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
     SendMessageW(resultsList_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
     SendMessageW(pathLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
     SendMessageW(statusLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+    SendMessageW(autostartLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
     SendMessageW(queryEdit_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search app, script, folder or path"));
-    SendMessageW(resultsList_, LB_SETITEMHEIGHT, 0, 32);
+    SendMessageW(queryEdit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
+    SendMessageW(resultsList_, LB_SETITEMHEIGHT, 0, 42);
 
     SetWindowSubclass(queryEdit_, EditSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
     SetWindowSubclass(resultsList_, ListSubclassProc, 2, reinterpret_cast<DWORD_PTR>(this));
     EnsureShellImageList();
     UpdateHintLabel();
+    RefreshAutostartToggle();
 }
 
 void LauncherApp::LayoutControls()
@@ -1157,15 +1383,35 @@ void LauncherApp::LayoutControls()
 
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;
-    const int margin = 18;
-    const int top = 14;
+    const int contentLeft = 14;
+    const int contentWidth = width - 28;
+    const int searchCardTop = 14;
+    const int searchCardWidth = contentWidth;
+    const int searchCardLeft = contentLeft;
+    const int searchCardHeight = 42;
+    const int resultsCardTop = 64;
+    const int resultsCardHeight = 286;
+    const int resultsListHeight = 42 * 5;
+    const int toggleWidth = 54;
+    const int toggleHeight = 26;
+    const int queryHeight = 20;
+
+    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 26, 26);
+    SetWindowRgn(mainWindow_, region, TRUE);
 
     MoveWindow(titleLabel_, 0, 0, 0, 0, FALSE);
-    MoveWindow(hintLabel_, margin + 2, top, width - margin * 2, 18, TRUE);
-    MoveWindow(queryEdit_, margin, top + 22, width - margin * 2, 34, TRUE);
-    MoveWindow(resultsList_, margin, top + 66, width - margin * 2, height - (top + 66) - 68, TRUE);
-    MoveWindow(pathLabel_, margin, height - 42, width - margin * 2, 18, TRUE);
-    MoveWindow(statusLabel_, margin, height - 22, width - margin * 2, 18, TRUE);
+    MoveWindow(hintLabel_, 0, 0, 0, 0, FALSE);
+    MoveWindow(sidebarChipLabel_, 0, 0, 0, 0, FALSE);
+    MoveWindow(sidebarFooterLabel_, 0, 0, 0, 0, FALSE);
+    MoveWindow(mainTitleLabel_, 0, 0, 0, 0, FALSE);
+    MoveWindow(mainSubtitleLabel_, 0, 0, 0, 0, FALSE);
+
+    MoveWindow(queryEdit_, searchCardLeft + 12, searchCardTop + (searchCardHeight - queryHeight) / 2, searchCardWidth - 24, queryHeight, TRUE);
+    MoveWindow(resultsList_, contentLeft + 12, resultsCardTop + 12, contentWidth - 24, resultsListHeight, TRUE);
+    MoveWindow(pathLabel_, contentLeft + 16, resultsCardTop + 236, contentWidth - 170, 18, TRUE);
+    MoveWindow(statusLabel_, contentLeft + 16, resultsCardTop + 258, contentWidth - 170, 18, TRUE);
+    MoveWindow(autostartLabel_, contentLeft + contentWidth - 128, resultsCardTop + 238, 68, 18, TRUE);
+    MoveWindow(autostartToggle_, contentLeft + contentWidth - toggleWidth - 16, resultsCardTop + 232, toggleWidth, toggleHeight, TRUE);
 }
 
 void LauncherApp::CreateTrayIcon()
@@ -1183,12 +1429,15 @@ void LauncherApp::CreateTrayIcon()
 
 void LauncherApp::ShowTrayMenu()
 {
+    autostartEnabled_ = IsAutostartEnabled();
+    RefreshAutostartToggle();
+
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kCommandTrayOpen, L"Open Launcher");
     AppendMenuW(menu, MF_STRING, kCommandTrayRebuild, L"Rebuild Index");
     AppendMenuW(menu, MF_STRING, kCommandTrayReloadSettings, L"Reload Settings");
     AppendMenuW(menu, MF_STRING, kCommandTrayOpenSettings, L"Open Settings");
-    AppendMenuW(menu, IsAutostartEnabled() ? MF_STRING | MF_CHECKED : MF_STRING, kCommandTrayToggleAutostart, L"Run at Startup");
+    AppendMenuW(menu, autostartEnabled_ ? MF_STRING | MF_CHECKED : MF_STRING, kCommandTrayToggleAutostart, L"Run at Startup");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCommandTrayExit, L"Exit");
 
@@ -1432,22 +1681,43 @@ void LauncherApp::UnregisterLauncherHotkey()
 
 void LauncherApp::UpdateHintLabel()
 {
-    if (hintLabel_ == nullptr)
+    if (hintLabel_ != nullptr)
     {
+        SetWindowTextW(hintLabel_, L"");
+    }
+    if (mainSubtitleLabel_ != nullptr)
+    {
+        SetWindowTextW(mainSubtitleLabel_, L"");
+    }
+    if (sidebarFooterLabel_ != nullptr)
+    {
+        SetWindowTextW(sidebarFooterLabel_, L"");
+    }
+}
+
+void LauncherApp::RefreshAutostartToggle()
+{
+    if (autostartToggle_ != nullptr)
+    {
+        InvalidateRect(autostartToggle_, nullptr, TRUE);
+        UpdateWindow(autostartToggle_);
+    }
+}
+
+void LauncherApp::ToggleAutostartSetting()
+{
+    const bool nextEnabled = !autostartEnabled_;
+    if (!SetAutostartEnabled(nextEnabled))
+    {
+        PublishStatus(L"Failed to update autostart.");
+        UpdateFooter();
         return;
     }
 
-    std::wstring hint;
-    if (activeHotkeyLabel_.empty())
-    {
-        hint = L"Tray | Enter run | Ctrl+Shift+Enter admin | Shift+Enter locate | Ctrl+C copy";
-    }
-    else
-    {
-        hint = activeHotkeyLabel_ + L" | Enter run | Ctrl+Shift+Enter admin | Shift+Enter locate | Ctrl+C copy";
-    }
-
-    SetWindowTextW(hintLabel_, hint.c_str());
+    autostartEnabled_ = nextEnabled;
+    RefreshAutostartToggle();
+    PublishStatus(autostartEnabled_ ? L"Autostart enabled." : L"Autostart disabled.");
+    UpdateFooter();
 }
 
 void LauncherApp::StartWatchThread()
@@ -1748,6 +2018,8 @@ void LauncherApp::InitializePreferredRoots()
 
 void LauncherApp::ShowLauncher()
 {
+    autostartEnabled_ = IsAutostartEnabled();
+    RefreshAutostartToggle();
     SetWindowTextW(queryEdit_, L"");
     queryUpdatePending_ = false;
     KillTimer(mainWindow_, kQueryDebounceTimerId);
@@ -1825,10 +2097,10 @@ void LauncherApp::PositionWindow()
     GetMonitorInfoW(MonitorFromWindow(mainWindow_, MONITOR_DEFAULTTOPRIMARY), &monitorInfo);
 
     const RECT& work = monitorInfo.rcWork;
-    const int width = 820;
-    const int height = 360;
+    const int width = 880;
+    const int height = 382;
     const int x = work.left + ((work.right - work.left) - width) / 2;
-    const int y = work.top + std::max(40, static_cast<int>((work.bottom - work.top) / 8));
+    const int y = work.top + std::max(26, static_cast<int>((work.bottom - work.top) / 10));
 
     SetWindowPos(mainWindow_, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
 }
@@ -2281,6 +2553,128 @@ void LauncherApp::ShowSelectedContextMenu(POINT screenPoint, bool fromKeyboard)
     DestroyMenu(menu);
 }
 
+void LauncherApp::DrawWindowBackground(HDC hdc)
+{
+    if (hdc == nullptr)
+    {
+        return;
+    }
+
+    RECT rect{};
+    GetClientRect(mainWindow_, &rect);
+
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    const int contentLeft = 14;
+    const int contentWidth = width - 28;
+    const int searchCardTop = 14;
+    const int searchCardWidth = contentWidth;
+    const int searchCardLeft = contentLeft;
+    const int searchCardHeight = 42;
+    const int resultsCardTop = 64;
+    const int resultsCardHeight = 286;
+
+    RECT fullRect{0, 0, width, height};
+    const HBRUSH pageBrush = CreateSolidBrush(RGB(246, 244, 240));
+    FillRect(hdc, &fullRect, pageBrush);
+    DeleteObject(pageBrush);
+
+    auto drawCard = [&](const RECT& sourceRect, COLORREF fill, COLORREF border, int radius)
+    {
+        RECT shadowRect = sourceRect;
+        OffsetRect(&shadowRect, 0, 4);
+        const HBRUSH shadowBrush = CreateSolidBrush(RGB(236, 233, 228));
+        const HPEN shadowPen = CreatePen(PS_SOLID, 1, RGB(236, 233, 228));
+        const HGDIOBJ oldShadowBrush = SelectObject(hdc, shadowBrush);
+        const HGDIOBJ oldShadowPen = SelectObject(hdc, shadowPen);
+        RoundRect(hdc, shadowRect.left, shadowRect.top, shadowRect.right, shadowRect.bottom, radius, radius);
+        SelectObject(hdc, oldShadowPen);
+        SelectObject(hdc, oldShadowBrush);
+        DeleteObject(shadowPen);
+        DeleteObject(shadowBrush);
+
+        const HBRUSH fillBrush = CreateSolidBrush(fill);
+        const HPEN borderPen = CreatePen(PS_SOLID, 1, border);
+        const HGDIOBJ oldFillBrush = SelectObject(hdc, fillBrush);
+        const HGDIOBJ oldBorderPen = SelectObject(hdc, borderPen);
+        RoundRect(hdc, sourceRect.left, sourceRect.top, sourceRect.right, sourceRect.bottom, radius, radius);
+        SelectObject(hdc, oldBorderPen);
+        SelectObject(hdc, oldFillBrush);
+        DeleteObject(borderPen);
+        DeleteObject(fillBrush);
+    };
+
+    RECT searchCard{searchCardLeft, searchCardTop, searchCardLeft + searchCardWidth, searchCardTop + searchCardHeight};
+    RECT resultsCard{contentLeft, resultsCardTop, contentLeft + contentWidth, resultsCardTop + resultsCardHeight};
+
+    drawCard(searchCard, RGB(255, 255, 255), RGB(232, 232, 236), 22);
+    drawCard(resultsCard, RGB(255, 255, 255), RGB(232, 232, 236), 24);
+
+    RECT footerRect{contentLeft + 14, resultsCard.bottom - 62, resultsCard.right - 14, resultsCard.bottom - 14};
+    const HBRUSH footerBrush = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(hdc, &footerRect, footerBrush);
+    DeleteObject(footerBrush);
+}
+
+void LauncherApp::DrawAutostartToggle(const DRAWITEMSTRUCT* drawItem)
+{
+    if (drawItem == nullptr)
+    {
+        return;
+    }
+
+    RECT bounds = drawItem->rcItem;
+    const HBRUSH boundsBrush = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(drawItem->hDC, &bounds, boundsBrush);
+    DeleteObject(boundsBrush);
+
+    RECT track = bounds;
+    InflateRect(&track, 0, -2);
+
+    const bool pressed = (drawItem->itemState & ODS_SELECTED) != 0;
+    const COLORREF trackColor = autostartEnabled_ ? RGB(52, 168, 83) : RGB(198, 204, 210);
+    const COLORREF borderColor = autostartEnabled_ ? RGB(43, 146, 72) : RGB(176, 183, 190);
+    const COLORREF knobColor = RGB(255, 255, 255);
+
+    const HBRUSH trackBrush = CreateSolidBrush(trackColor);
+    const HPEN trackPen = CreatePen(PS_SOLID, 1, borderColor);
+    const HGDIOBJ oldBrush = SelectObject(drawItem->hDC, trackBrush);
+    const HGDIOBJ oldPen = SelectObject(drawItem->hDC, trackPen);
+    RoundRect(drawItem->hDC, track.left, track.top, track.right, track.bottom, track.bottom - track.top, track.bottom - track.top);
+    SelectObject(drawItem->hDC, oldPen);
+    SelectObject(drawItem->hDC, oldBrush);
+    DeleteObject(trackPen);
+    DeleteObject(trackBrush);
+
+    const int inset = 4;
+    const int knobSize = (track.bottom - track.top) - inset * 2;
+    int knobLeft = autostartEnabled_
+        ? track.right - inset - knobSize
+        : track.left + inset;
+    if (pressed)
+    {
+        knobLeft += autostartEnabled_ ? -1 : 1;
+    }
+
+    const RECT knobRect{knobLeft, track.top + inset, knobLeft + knobSize, track.top + inset + knobSize};
+    const HBRUSH knobBrush = CreateSolidBrush(knobColor);
+    const HPEN knobPen = CreatePen(PS_SOLID, 1, RGB(214, 218, 224));
+    const HGDIOBJ oldKnobBrush = SelectObject(drawItem->hDC, knobBrush);
+    const HGDIOBJ oldKnobPen = SelectObject(drawItem->hDC, knobPen);
+    Ellipse(drawItem->hDC, knobRect.left, knobRect.top, knobRect.right, knobRect.bottom);
+    SelectObject(drawItem->hDC, oldKnobPen);
+    SelectObject(drawItem->hDC, oldKnobBrush);
+    DeleteObject(knobPen);
+    DeleteObject(knobBrush);
+
+    if ((drawItem->itemState & ODS_FOCUS) != 0)
+    {
+        RECT focusRect = bounds;
+        InflateRect(&focusRect, -1, -1);
+        DrawFocusRect(drawItem->hDC, &focusRect);
+    }
+}
+
 void LauncherApp::DrawResultItem(const DRAWITEMSTRUCT* drawItem)
 {
     if (drawItem == nullptr || drawItem->itemID == static_cast<UINT>(-1))
@@ -2289,12 +2683,26 @@ void LauncherApp::DrawResultItem(const DRAWITEMSTRUCT* drawItem)
     }
 
     const bool selected = (drawItem->itemState & ODS_SELECTED) != 0;
-    const COLORREF background = selected ? RGB(217, 235, 255) : RGB(250, 250, 252);
     const COLORREF foreground = RGB(28, 28, 28);
 
-    const HBRUSH brush = CreateSolidBrush(background);
-    FillRect(drawItem->hDC, &drawItem->rcItem, brush);
-    DeleteObject(brush);
+    const HBRUSH baseBrush = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(drawItem->hDC, &drawItem->rcItem, baseBrush);
+    DeleteObject(baseBrush);
+
+    RECT pillRect = drawItem->rcItem;
+    InflateRect(&pillRect, -5, -4);
+    if (selected)
+    {
+        const HBRUSH highlightBrush = CreateSolidBrush(RGB(239, 244, 252));
+        const HPEN highlightPen = CreatePen(PS_SOLID, 1, RGB(219, 228, 242));
+        const HGDIOBJ oldHighlightBrush = SelectObject(drawItem->hDC, highlightBrush);
+        const HGDIOBJ oldHighlightPen = SelectObject(drawItem->hDC, highlightPen);
+        RoundRect(drawItem->hDC, pillRect.left, pillRect.top, pillRect.right, pillRect.bottom, 16, 16);
+        SelectObject(drawItem->hDC, oldHighlightPen);
+        SelectObject(drawItem->hDC, oldHighlightBrush);
+        DeleteObject(highlightPen);
+        DeleteObject(highlightBrush);
+    }
     SetBkMode(drawItem->hDC, TRANSPARENT);
     SetTextColor(drawItem->hDC, foreground);
 
@@ -2320,21 +2728,24 @@ void LauncherApp::DrawResultItem(const DRAWITEMSTRUCT* drawItem)
             entry = actualEntry;
         }
     }
-    const int iconX = drawItem->rcItem.left + 8;
-    const int iconY = drawItem->rcItem.top + 7;
+    const int iconX = pillRect.left + 10;
+    const int iconY = pillRect.top + 8;
 
     if (shellImageList_ != nullptr && iconIndex >= 0)
     {
         ImageList_Draw(shellImageList_, iconIndex, drawItem->hDC, iconX, iconY, ILD_NORMAL);
     }
 
-    RECT textRect = drawItem->rcItem;
-    textRect.left += 34;
+    RECT textRect = pillRect;
+    textRect.left += 40;
+    textRect.right -= 12;
     DrawTextW(drawItem->hDC, BuildDisplayLabel(entry).c_str(), -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
     if ((drawItem->itemState & ODS_FOCUS) != 0)
     {
-        DrawFocusRect(drawItem->hDC, &drawItem->rcItem);
+        RECT focusRect = pillRect;
+        InflateRect(&focusRect, -1, -1);
+        DrawFocusRect(drawItem->hDC, &focusRect);
     }
 }
 
@@ -3118,13 +3529,14 @@ int LauncherApp::CalculateScore(
     int priorityBoost)
 {
     const int extensionBoost = ExtensionBoost(entry.extension);
-    const int directoryBoost = entry.isDirectory ? 30 : 0;
+    const int categoryBoost = GetEntryCategoryBoost(entry, queryCompact.size());
     const int usageBoost = std::min((usage == nullptr ? 0 : usage->launchCount) * 90, 1200);
     const int recencyBoost = CalculateRecencyBoost(usage == nullptr ? 0 : usage->lastLaunchUtcTicks);
 
     if (queryCompact.empty())
     {
-        return 900 + usageBoost + recencyBoost + extensionBoost + directoryBoost + priorityBoost - std::min(static_cast<int>(entry.name.size()) * 3, 180);
+        return 900 + usageBoost + recencyBoost + extensionBoost + categoryBoost + priorityBoost
+            - std::min(static_cast<int>(entry.name.size()) * 3, 180);
     }
 
     const int nameScore = ScorePattern(queryCompact, entry.searchNameCompact);
@@ -3153,7 +3565,8 @@ int LauncherApp::CalculateScore(
     }
 
     const int affinityBoost = std::min(queryAffinity * 320, 2600);
-    int score = nameScore * 2 + initialsScore * 2 + pathScore + tokenBonus + affinityBoost + usageBoost + recencyBoost + extensionBoost + directoryBoost + priorityBoost;
+    int score = nameScore * 2 + initialsScore * 2 + pathScore + tokenBonus + affinityBoost + usageBoost + recencyBoost
+        + extensionBoost + categoryBoost + priorityBoost;
     score -= std::min(static_cast<int>(entry.name.size()) * 4, 220);
     return score;
 }
@@ -3478,6 +3891,13 @@ int LauncherApp::CompareResults(const SearchResult& left, const SearchResult& ri
 
     const auto& leftEntry = entries[left.entryIndex];
     const auto& rightEntry = entries[right.entryIndex];
+    const int leftRank = GetEntryResultRank(leftEntry);
+    const int rightRank = GetEntryResultRank(rightEntry);
+
+    if (leftRank != rightRank)
+    {
+        return leftRank - rightRank;
+    }
 
     if (leftEntry.name.size() != rightEntry.name.size())
     {
@@ -3691,7 +4111,7 @@ int LauncherApp::GetLaunchSurfaceBoost(const LaunchEntry& entry) const
     }
 
     const auto normalized = NormalizeDirectoryPath(entry.fullPath);
-    const int folderBoost = entry.isDirectory ? 220 : 0;
+    const int folderBoost = entry.isDirectory ? 40 : 0;
     const int linkBoost = entry.extension == L".lnk" ? 120 : 0;
 
     if (IsUnderAnyRoot(normalized, pinnedRoots_))
