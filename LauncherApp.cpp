@@ -263,7 +263,313 @@ struct SearchDirective
 {
     std::wstring queryText;
     std::wstring preferredExtension;
+    std::wstring preferredDirectory;
 };
+
+bool DirectoryExists(const std::wstring& path)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool TrySplitDirectoryBrowseScope(
+    const std::wstring& preferredDirectory,
+    std::wstring& browseRoot,
+    std::wstring& leafPrefix)
+{
+    if (preferredDirectory.empty())
+    {
+        return false;
+    }
+
+    if (DirectoryExists(preferredDirectory))
+    {
+        browseRoot = preferredDirectory;
+        leafPrefix.clear();
+        return true;
+    }
+
+    const auto slashIndex = preferredDirectory.find_last_of(L'\\');
+    if (slashIndex == std::wstring::npos)
+    {
+        return false;
+    }
+
+    if (slashIndex == 2 && preferredDirectory.size() >= 3 && preferredDirectory[1] == L':')
+    {
+        browseRoot = preferredDirectory.substr(0, 3);
+    }
+    else
+    {
+        browseRoot = preferredDirectory.substr(0, slashIndex);
+    }
+
+    leafPrefix = preferredDirectory.substr(slashIndex + 1);
+    return DirectoryExists(browseRoot);
+}
+
+bool TryCreateBrowseEntry(const std::wstring& fullPath, const WIN32_FIND_DATAW& data, LaunchEntry& entry)
+{
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        entry.fullPath = fullPath;
+        entry.name = data.cFileName;
+        entry.extension = L"";
+        entry.sourceTag = BuildSourceTag(fullPath, true);
+        entry.searchNameCompact = NormalizeCompact(entry.name);
+        entry.searchPathCompact = NormalizeCompact(fullPath);
+        entry.searchInitials = BuildInitials(entry.name);
+        entry.isDirectory = true;
+        entry.lastWriteUtcTicks = FileTimeToTicks(data.ftLastWriteTime);
+        return !entry.name.empty();
+    }
+
+    const auto extension = GetExtension(data.cFileName);
+    if (!IsLaunchableExtension(extension))
+    {
+        return false;
+    }
+
+    const auto name = GetFileNameWithoutExtension(data.cFileName);
+    entry.fullPath = fullPath;
+    entry.name = name.empty() ? data.cFileName : name;
+    entry.extension = extension;
+    entry.sourceTag = BuildSourceTag(fullPath, false);
+    entry.searchNameCompact = NormalizeCompact(entry.name);
+    entry.searchPathCompact = NormalizeCompact(fullPath);
+    entry.searchInitials = BuildInitials(entry.name);
+    entry.isDirectory = false;
+    entry.lastWriteUtcTicks = FileTimeToTicks(data.ftLastWriteTime);
+    return true;
+}
+
+std::vector<LaunchEntry> CollectDirectoryDirectiveEntries(const std::wstring& preferredDirectory)
+{
+    std::wstring browseRoot;
+    std::wstring leafPrefix;
+    if (!TrySplitDirectoryBrowseScope(preferredDirectory, browseRoot, leafPrefix))
+    {
+        return {};
+    }
+
+    const auto normalizedLeafPrefix = NormalizeCompact(leafPrefix);
+    std::vector<LaunchEntry> entries;
+    WIN32_FIND_DATAW data{};
+    const auto searchPath = JoinPath(browseRoot, L"*");
+    const HANDLE findHandle = FindFirstFileW(searchPath.c_str(), &data);
+    if (findHandle == INVALID_HANDLE_VALUE)
+    {
+        return entries;
+    }
+
+    do
+    {
+        const std::wstring fileName = data.cFileName;
+        if (fileName == L"." || fileName == L"..")
+        {
+            continue;
+        }
+
+        const auto fullPath = JoinPath(browseRoot, fileName);
+        LaunchEntry entry;
+        if (!TryCreateBrowseEntry(fullPath, data, entry))
+        {
+            continue;
+        }
+
+        if (!normalizedLeafPrefix.empty())
+        {
+            const auto nameCompact = NormalizeCompact(entry.name);
+            const auto pathCompact = NormalizeCompact(entry.fullPath);
+            if (!StartsWith(nameCompact, normalizedLeafPrefix) && !StartsWith(pathCompact, NormalizeCompact(preferredDirectory)))
+            {
+                continue;
+            }
+        }
+
+        entries.push_back(std::move(entry));
+    }
+    while (FindNextFileW(findHandle, &data));
+
+    FindClose(findHandle);
+    return entries;
+}
+
+struct DirectoryDirectiveScope
+{
+    bool enabled = false;
+    bool exactDirectory = false;
+    std::wstring browseRoot;
+    std::wstring browseParentKey;
+    std::wstring leafPrefixCompact;
+    std::wstring browsePathPrefixCompact;
+};
+
+DirectoryDirectiveScope BuildDirectoryDirectiveScope(const std::wstring& preferredDirectory)
+{
+    DirectoryDirectiveScope scope{};
+    if (preferredDirectory.empty())
+    {
+        return scope;
+    }
+
+    scope.exactDirectory = DirectoryExists(preferredDirectory);
+    if (!TrySplitDirectoryBrowseScope(preferredDirectory, scope.browseRoot, scope.leafPrefixCompact))
+    {
+        return scope;
+    }
+
+    scope.enabled = true;
+    scope.browseParentKey = NormalizeDirectoryPath(GetDirectoryPart(JoinPath(scope.browseRoot, L"x")));
+    scope.leafPrefixCompact = NormalizeCompact(scope.leafPrefixCompact);
+    scope.browsePathPrefixCompact = NormalizeCompact(JoinPath(scope.browseRoot, scope.leafPrefixCompact));
+    return scope;
+}
+
+int CalculateDirectoryDirectiveBoost(
+    const LaunchEntry& entry,
+    const DirectoryDirectiveScope& scope,
+    bool emptyQuery)
+{
+    if (!scope.enabled)
+    {
+        return 0;
+    }
+
+    const auto parentPath = NormalizeDirectoryPath(GetDirectoryPart(entry.fullPath));
+    const bool inCurrentBrowseLevel = parentPath == scope.browseParentKey;
+    const bool isLeafPrefixMatch = scope.leafPrefixCompact.empty()
+        || StartsWith(entry.searchNameCompact, scope.leafPrefixCompact)
+        || StartsWith(entry.searchPathCompact, scope.browsePathPrefixCompact);
+
+    if (scope.exactDirectory)
+    {
+        if (!inCurrentBrowseLevel)
+        {
+            return emptyQuery ? -2200 : -900;
+        }
+
+        if (entry.isDirectory)
+        {
+            return 3200;
+        }
+
+        return 900;
+    }
+
+    if (!inCurrentBrowseLevel || !isLeafPrefixMatch)
+    {
+        return emptyQuery ? -2200 : -900;
+    }
+
+    if (entry.isDirectory)
+    {
+        return 3400;
+    }
+
+    return 700;
+}
+
+std::vector<LaunchEntry> CollectBrowseRootEntries(const std::wstring& browseRoot)
+{
+    std::vector<LaunchEntry> entries;
+    if (!DirectoryExists(browseRoot))
+    {
+        return entries;
+    }
+
+    WIN32_FIND_DATAW data{};
+    const auto searchPath = JoinPath(browseRoot, L"*");
+    const HANDLE findHandle = FindFirstFileW(searchPath.c_str(), &data);
+    if (findHandle == INVALID_HANDLE_VALUE)
+    {
+        return entries;
+    }
+
+    do
+    {
+        const std::wstring fileName = data.cFileName;
+        if (fileName == L"." || fileName == L"..")
+        {
+            continue;
+        }
+
+        const auto fullPath = JoinPath(browseRoot, fileName);
+        LaunchEntry entry;
+        if (!TryCreateBrowseEntry(fullPath, data, entry))
+        {
+            continue;
+        }
+
+        entries.push_back(std::move(entry));
+    }
+    while (FindNextFileW(findHandle, &data));
+
+    FindClose(findHandle);
+    return entries;
+}
+
+bool TrySplitDirectoryDirectiveValue(
+    const std::wstring& rawValue,
+    std::wstring& directoryPath,
+    std::wstring& queryText)
+{
+    auto value = TrimCopy(rawValue);
+    if (value.empty())
+    {
+        return false;
+    }
+
+    if (value.front() == L'"')
+    {
+        const auto closingQuote = value.find(L'"', 1);
+        if (closingQuote == std::wstring::npos)
+        {
+            return false;
+        }
+
+        directoryPath = value.substr(1, closingQuote - 1);
+        queryText = TrimCopy(value.substr(closingQuote + 1));
+        return !directoryPath.empty();
+    }
+
+    if (DirectoryExists(value))
+    {
+        directoryPath = value;
+        queryText.clear();
+        return true;
+    }
+
+    for (size_t pos = value.find_last_of(L" \t"); pos != std::wstring::npos; )
+    {
+        const auto candidate = TrimCopy(value.substr(0, pos));
+        if (!candidate.empty() && DirectoryExists(candidate))
+        {
+            directoryPath = candidate;
+            queryText = TrimCopy(value.substr(pos + 1));
+            return true;
+        }
+
+        if (pos == 0)
+        {
+            break;
+        }
+
+        pos = value.find_last_of(L" \t", pos - 1);
+    }
+
+    const auto splitPos = value.find_first_of(L" \t");
+    if (splitPos == std::wstring::npos)
+    {
+        directoryPath = value;
+        queryText.clear();
+        return true;
+    }
+
+    directoryPath = TrimCopy(value.substr(0, splitPos));
+    queryText = TrimCopy(value.substr(splitPos + 1));
+    return !directoryPath.empty();
+}
 
 std::vector<std::wstring> SplitHotkeyTokens(const std::wstring& value)
 {
@@ -553,6 +859,20 @@ SearchDirective ParseSearchDirective(const std::wstring& rawQuery)
     directive.queryText = rawQuery;
 
     const auto trimmed = TrimCopy(rawQuery);
+    if (StartsWith(trimmed, L"/dir:"))
+    {
+        std::wstring directoryPath;
+        std::wstring queryText;
+        if (!TrySplitDirectoryDirectiveValue(trimmed.substr(5), directoryPath, queryText))
+        {
+            return directive;
+        }
+
+        directive.preferredDirectory = NormalizeDirectoryPath(directoryPath);
+        directive.queryText = queryText;
+        return directive;
+    }
+
     if (!StartsWith(trimmed, L"/."))
     {
         return directive;
@@ -1957,6 +2277,7 @@ void LauncherApp::SearchLoop()
         {
             std::wstring query;
             std::wstring preferredExtension;
+            std::wstring preferredDirectory;
             std::shared_ptr<std::vector<LaunchEntry>> entriesSnapshot;
             std::unordered_map<std::wstring, UsageStat> usageSnapshot;
             std::unordered_map<std::wstring, QueryBucket> queryHistorySnapshot;
@@ -1977,6 +2298,7 @@ void LauncherApp::SearchLoop()
                 searchRequestPending_ = false;
                 query = pendingSearchQuery_;
                 preferredExtension = pendingSearchPreferredExtension_;
+                preferredDirectory = pendingSearchPreferredDirectory_;
                 entriesSnapshot = pendingSearchEntries_;
                 usageSnapshot = pendingSearchUsage_;
                 queryHistorySnapshot = pendingSearchHistory_;
@@ -1988,6 +2310,11 @@ void LauncherApp::SearchLoop()
                 requestId = pendingSearchRequestId_;
             }
 
+            if (!preferredDirectory.empty())
+            {
+                entriesSnapshot = BuildDirectoryDirectiveEntries(preferredDirectory);
+            }
+
             std::vector<size_t> matchedIndices;
             auto results = BuildResultsForQuery(
                 query,
@@ -1997,6 +2324,7 @@ void LauncherApp::SearchLoop()
                 excludedRoots,
                 priorityRoots,
                 preferredExtension,
+                preferredDirectory,
                 requestId,
                 candidateIndices.empty() ? nullptr : &candidateIndices,
                 &matchedIndices);
@@ -2194,6 +2522,48 @@ void LauncherApp::RebuildSearchCaches()
     }
 }
 
+std::shared_ptr<std::vector<LaunchEntry>> LauncherApp::BuildDirectoryDirectiveEntries(const std::wstring& preferredDirectory)
+{
+    const auto scope = BuildDirectoryDirectiveScope(preferredDirectory);
+    if (!scope.enabled)
+    {
+        return std::make_shared<std::vector<LaunchEntry>>();
+    }
+
+    std::vector<LaunchEntry> browseEntries;
+    bool cacheHit = false;
+    {
+        ScopedCriticalSection lock(dataLock_);
+        cacheHit = directoryBrowseCacheRoot_ == scope.browseRoot && !directoryBrowseCacheEntries_.empty();
+        if (cacheHit)
+        {
+            browseEntries = directoryBrowseCacheEntries_;
+        }
+    }
+
+    if (!cacheHit)
+    {
+        browseEntries = CollectBrowseRootEntries(scope.browseRoot);
+        ScopedCriticalSection lock(dataLock_);
+        directoryBrowseCacheRoot_ = scope.browseRoot;
+        directoryBrowseCacheEntries_ = browseEntries;
+    }
+
+    auto filtered = std::make_shared<std::vector<LaunchEntry>>();
+    filtered->reserve(browseEntries.size());
+    for (const auto& entry : browseEntries)
+    {
+        if (scope.leafPrefixCompact.empty()
+            || ScorePattern(scope.leafPrefixCompact, entry.searchNameCompact) > 0
+            || ScorePattern(scope.browsePathPrefixCompact, entry.searchPathCompact) > 0)
+        {
+            filtered->push_back(entry);
+        }
+    }
+
+    return filtered;
+}
+
 void LauncherApp::UpdateResults()
 {
     const auto rawQuery = ReadControlText(queryEdit_);
@@ -2218,6 +2588,15 @@ void LauncherApp::UpdateResults()
         excludedRoots = settings_.excludeDirectories;
         priorityRoots = settings_.priorityDirectories;
         candidateIndices = BuildCandidateIndicesLocked(query, queryCompact, queryTokens, entriesSnapshot);
+        if (directive.preferredDirectory.empty() == false)
+        {
+            candidateIndices.clear();
+        }
+    }
+
+    if (!directive.preferredDirectory.empty())
+    {
+        entriesSnapshot = BuildDirectoryDirectiveEntries(directive.preferredDirectory);
     }
 
     auto results = BuildResultsForQuery(
@@ -2228,6 +2607,7 @@ void LauncherApp::UpdateResults()
         excludedRoots,
         priorityRoots,
         directive.preferredExtension,
+        directive.preferredDirectory,
         0,
         candidateIndices.empty() ? nullptr : &candidateIndices,
         nullptr);
@@ -2260,7 +2640,9 @@ void LauncherApp::UpdateResults()
 void LauncherApp::ScheduleResultsUpdate()
 {
     queryUpdatePending_ = true;
-    SetTimer(mainWindow_, kQueryDebounceTimerId, 120, nullptr);
+    const auto rawQuery = ReadControlText(queryEdit_);
+    const auto directive = ParseSearchDirective(rawQuery);
+    SetTimer(mainWindow_, kQueryDebounceTimerId, directive.preferredDirectory.empty() ? 120 : 220, nullptr);
 }
 
 void LauncherApp::RequestSearchUpdate()
@@ -2286,6 +2668,7 @@ void LauncherApp::RequestSearchUpdate()
         ScopedCriticalSection lock(dataLock_);
         pendingSearchQuery_ = query;
         pendingSearchPreferredExtension_ = directive.preferredExtension;
+        pendingSearchPreferredDirectory_ = directive.preferredDirectory;
         pendingSearchEntries_ = entries_;
         pendingSearchUsage_ = usage_;
         pendingSearchHistory_ = queryHistory_;
@@ -2294,6 +2677,10 @@ void LauncherApp::RequestSearchUpdate()
         pendingSearchHasDirectEntry_ = hasDirectEntry;
         pendingSearchDirectEntry_ = directEntry;
         pendingSearchCandidateIndices_ = BuildCandidateIndicesLocked(query, queryCompact, queryTokens, pendingSearchEntries_);
+        if (directive.preferredDirectory.empty() == false)
+        {
+            pendingSearchCandidateIndices_.clear();
+        }
         pendingSearchRequestId_ = ++latestSearchRequestId_;
         searchRequestPending_ = true;
     }
@@ -3571,13 +3958,15 @@ int LauncherApp::CalculateScore(
     const UsageStat* usage,
     int queryAffinity,
     int priorityBoost,
-    const std::wstring& preferredExtension)
+    const std::wstring& preferredExtension,
+    const std::wstring& preferredDirectory)
 {
     const int extensionBoost = ExtensionBoost(entry.extension);
     const int categoryBoost = GetEntryCategoryBoost(entry, queryCompact.size());
     const int usageBoost = std::min((usage == nullptr ? 0 : usage->launchCount) * 90, 1200);
     const int recencyBoost = CalculateRecencyBoost(usage == nullptr ? 0 : usage->lastLaunchUtcTicks);
     int directiveBoost = 0;
+    static_cast<void>(preferredDirectory);
 
     if (!preferredExtension.empty())
     {
@@ -3743,7 +4132,7 @@ std::vector<size_t> LauncherApp::BuildEmptyQueryCandidateIndices(
             }
         }
 
-        const int score = CalculateScore(entry, L"", {}, usage, 0, priorityBoost, L"");
+        const int score = CalculateScore(entry, L"", {}, usage, 0, priorityBoost, L"", L"");
         if (score <= 0)
         {
             continue;
@@ -3769,6 +4158,7 @@ std::vector<SearchResult> LauncherApp::BuildResultsForQuery(
     const std::vector<std::wstring>& excludedRoots,
     const std::vector<std::wstring>& priorityRoots,
     const std::wstring& preferredExtension,
+    const std::wstring& preferredDirectory,
     unsigned long long requestId,
     const std::vector<size_t>* candidateIndices,
     std::vector<size_t>* matchedIndices) const
@@ -3786,6 +4176,7 @@ std::vector<SearchResult> LauncherApp::BuildResultsForQuery(
     const auto queryCompact = NormalizeCompact(query);
     const auto queryTokens = TokenizeQuery(query);
     const auto queryAffinity = BuildQueryAffinitySnapshot(queryHistorySnapshot, queryCompact);
+    const auto directoryScope = BuildDirectoryDirectiveScope(preferredDirectory);
     const auto& entries = *entriesSnapshot;
     size_t processedCount = 0;
     bool reusableOverflow = false;
@@ -3840,7 +4231,8 @@ std::vector<SearchResult> LauncherApp::BuildResultsForQuery(
             }
         }
 
-        const int score = CalculateScore(entry, queryCompact, queryTokens, usage, affinity, priorityBoost, preferredExtension);
+        int score = CalculateScore(entry, queryCompact, queryTokens, usage, affinity, priorityBoost, preferredExtension, L"");
+        score += CalculateDirectoryDirectiveBoost(entry, directoryScope, queryCompact.empty());
         if (score <= 0)
         {
             return true;

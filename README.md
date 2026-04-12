@@ -14,6 +14,7 @@ A native Win32 launcher focused on low background overhead. / 一个专注于低
 - Fuzzy matching plus initials matching for acronym and pinyin-initial style search / 支持模糊匹配和首字母匹配，适合缩写和拼音首字母搜索
 - Frequent launches and query-specific history move results upward / 常用结果和查询历史会提升排序
 - Prefix search with `/.bat:` or `/.lnk:` to prioritize that extension, for example `/.bat: deploy` / 可以用 `/.bat:` 或 `/.lnk:` 这样的前缀优先显示对应后缀，例如 `/.bat: deploy`
+- Prefix search with `/dir:` to prioritize directories first and browse the current path level, for example `/dir:E:\\`, `/dir:E:\\Tools`, or `/dir:\"E:\\Program Files\" obsidian` / 可以用 `/dir:` 前缀优先显示目录，并浏览当前路径层级，例如 `/dir:E:\\`、`/dir:E:\\Tools` 或 `/dir:\"E:\\Program Files\" obsidian`
 - Launchable results like `.lnk`, `.exe`, `.bat`, and `.cmd` are ranked ahead of folder matches / `.lnk`、`.exe`、`.bat`、`.cmd` 这类可启动结果会排在文件夹之前
 - Empty query uses a cached home list, so hotkey summon can show recommendations without a fresh full-index sort / 空查询会使用缓存首页列表，热键呼出时不用重新全量排序也能显示推荐
 - Start Menu, Desktop, and pinned shortcut entries get extra ranking priority / 开始菜单、桌面和固定入口会获得额外排序加成

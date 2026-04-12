@@ -156,7 +156,8 @@ private:
         const UsageStat* usage,
         int queryAffinity,
         int priorityBoost,
-        const std::wstring& preferredExtension);
+        const std::wstring& preferredExtension,
+        const std::wstring& preferredDirectory);
     std::vector<size_t> BuildCandidateIndicesLocked(
         const std::wstring& query,
         const std::wstring& queryCompact,
@@ -174,11 +175,13 @@ private:
         const std::vector<std::wstring>& excludedRoots,
         const std::vector<std::wstring>& priorityRoots,
         const std::wstring& preferredExtension,
+        const std::wstring& preferredDirectory,
         unsigned long long requestId,
         const std::vector<size_t>* candidateIndices,
         std::vector<size_t>* matchedIndices) const;
     static void InsertRanked(std::vector<SearchResult>& results, const SearchResult& candidate, size_t limit, const std::vector<LaunchEntry>& entries);
     static int CompareResults(const SearchResult& left, const SearchResult& right, const std::vector<LaunchEntry>& entries);
+    std::shared_ptr<std::vector<LaunchEntry>> BuildDirectoryDirectiveEntries(const std::wstring& preferredDirectory);
 
     void ScanRoot(const std::wstring& root, std::vector<LaunchEntry>& results, size_t& nextStatusThreshold);
     static bool TryCreateEntry(const std::wstring& fullPath, const WIN32_FIND_DATAW& data, LaunchEntry& entry);
@@ -238,6 +241,7 @@ private:
     unsigned long long pendingSearchRequestId_ = 0;
     std::wstring pendingSearchQuery_;
     std::wstring pendingSearchPreferredExtension_;
+    std::wstring pendingSearchPreferredDirectory_;
     std::shared_ptr<std::vector<LaunchEntry>> pendingSearchEntries_;
     std::unordered_map<std::wstring, UsageStat> pendingSearchUsage_;
     std::unordered_map<std::wstring, QueryBucket> pendingSearchHistory_;
@@ -253,6 +257,8 @@ private:
     LaunchEntry readySearchDirectEntry_;
     std::wstring readySearchQueryCompact_;
     std::vector<size_t> readySearchMatchedIndices_;
+    std::wstring directoryBrowseCacheRoot_;
+    std::vector<LaunchEntry> directoryBrowseCacheEntries_;
     bool hasDirectEntry_ = false;
     LaunchEntry directEntry_;
     std::wstring statusText_ = L"Preparing cache...";
