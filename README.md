@@ -37,12 +37,3 @@
 ## 开机自启
 可通过托盘菜单或主窗口中的 `Run at Startup` 开关，将启动器加入或移出
 
-
-```bat
-build.bat
-```
-
-## Output / 输出
-
-- `QuickLauncherNative.exe` / 主程序文件 `QuickLauncherNative.exe`
-- The first run after this update rebuilds the cache into `launcher-index-v3.tsv` / 本次更新后的首次运行会把缓存重建到 `launcher-index-v3.tsv`
